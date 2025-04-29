@@ -28,7 +28,6 @@ def extract_field_counts(json_path, field_id, debug=False):
     for issue in issues:
         key = issue.get('key')
         created_dt = parse_iso(issue['fields']['created'])
-        events = []
         histories = issue.get('changelog', {}).get('histories', [])
         history_events = []
         for hist in histories:
@@ -40,13 +39,14 @@ def extract_field_counts(json_path, field_id, debug=False):
                     history_events.append((ts, from_s, to_s))
         history_events.sort(key=lambda x: x[0])
 
+        # 初期ステータス
         if history_events and history_events[0][1]:
             init_status = history_events[0][1]
         else:
             val = issue['fields'].get(field_id)
             init_status = val.get('name') if isinstance(val, dict) else val
 
-        events.append((datetime.combine(created_dt.date(), time(0), tzinfo=timezone.utc), init_status))
+        events = [(datetime.combine(created_dt.date(), time(0), tzinfo=timezone.utc), init_status)]
         all_statuses.add(init_status)
         for ts, _from, to in history_events:
             events.append((ts, to))
@@ -64,7 +64,7 @@ def extract_field_counts(json_path, field_id, debug=False):
 
     status_list = sorted(all_statuses)
     daily_counts = []
-    for single_date in (start_date + timedelta(n) for n in range((end_date - start_date).days + 1)):
+    for single_date in (start_date + timedelta(days=n) for n in range((end_date - start_date).days + 1)):
         snapshot = datetime.combine(single_date, time(0), tzinfo=timezone.utc)
         count = defaultdict(int)
         for key, events in ticket_events.items():
@@ -81,36 +81,35 @@ def extract_field_counts(json_path, field_id, debug=False):
         row = [single_date.isoformat()] + [count[s] for s in status_list]
         daily_counts.append(row)
 
-    default_csv = 'stat_status.csv'
-    with open(default_csv, 'w', newline='', encoding='utf-8') as f:
+    stat_csv = 'stat_status.csv'
+    with open(stat_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['Date'] + status_list)
         writer.writerows(daily_counts)
 
-    files = [default_csv]
+    files = [stat_csv]
     if field_id != 'status':
-        extra = f'stat_{field_id}.csv'
-        with open(extra, 'w', newline='', encoding='utf-8') as f:
+        extra_csv = f'stat_{field_id}.csv'
+        with open(extra_csv, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['Date'] + status_list)
             writer.writerows(daily_counts)
-        files.append(extra)
+        files.append(extra_csv)
 
     return files, status_list
 
 
 def extract_flow_counts(json_path, config_path, field_id, debug=False):
-    # JSON からチケットごとの遷移履歴を抽出
+    # JSON から履歴遷移を抽出
     with open(json_path, encoding='utf-8') as f:
         data = json.load(f)
     issues = data.get('issues', [])
 
-    transitions = []  # 各チケット・日付ごとの (ticket_key, datestr, from, to)
+    transitions = []  # (ticket_key, datestr, from, to)
     statuses = set()
     for issue in issues:
         key = issue.get('key')
-        histories = issue.get('changelog', {}).get('histories', [])
-        for hist in histories:
+        for hist in issue.get('changelog', {}).get('histories', []):
             ts = parse_iso(hist.get('created'))
             datestr = ts.date().isoformat()
             for item in hist.get('items', []):
@@ -120,7 +119,7 @@ def extract_flow_counts(json_path, config_path, field_id, debug=False):
                     transitions.append((key, datestr, _from, _to))
                     statuses.update([_from, _to])
 
-    # 初回実行時は設定ファイルを自動生成（デフォルト: IGNORE）
+    # 設定ファイル初回生成
     if not os.path.exists(config_path):
         matrix = {s: {t: 'IGNORE' for t in statuses} for s in statuses}
         with open(config_path, 'w', encoding='utf-8') as f:
@@ -131,7 +130,7 @@ def extract_flow_counts(json_path, config_path, field_id, debug=False):
     with open(config_path, encoding='utf-8') as f:
         config = json.load(f)
 
-    # 件数集計: チケット・日付ごとに IN/OUT カウント
+    # チケット・日付ごとに遷移をカウント
     ticket_date_counts = defaultdict(lambda: {'IN': 0, 'OUT': 0})
     for key, datestr, _from, _to in transitions:
         action = config.get(_from, {}).get(_to, 'IGNORE')
@@ -142,15 +141,23 @@ def extract_flow_counts(json_path, config_path, field_id, debug=False):
         elif action == 'INOUT':
             ticket_date_counts[(key, datestr)]['IN'] += 1
             ticket_date_counts[(key, datestr)]['OUT'] += 1
-        # IGNORE は無視
         if debug:
-            print(f"[{key}][{datestr}] Transition {_from}->{_to} as {action}")
+            print(f"[{key}][{datestr}] {_from}->{_to} as {action}")
 
-    # 日付ごとにルール適用: IN>OUT => IN=1,OUT=0; IN<OUT => IN=0,OUT=1; IN=OUT => IN=1,OUT=1
+    # 日付範囲を決定（遷移の最古日～今日）
+    if transitions:
+        dates = [date.fromisoformat(d) for (_, d, _, _) in transitions]
+        start_date = min(dates)
+    else:
+        start_date = datetime.now(timezone.utc).date()
+    end_date = datetime.now(timezone.utc).date()
+
+    # 日次フロー集計
     flow_counts = defaultdict(lambda: {'IN': 0, 'OUT': 0})
     for (key, datestr), cnts in ticket_date_counts.items():
         in_ct = cnts['IN']
         out_ct = cnts['OUT']
+        # ルール適用
         if in_ct > out_ct:
             flow_counts[datestr]['IN'] += 1
         elif in_ct < out_ct:
@@ -159,14 +166,19 @@ def extract_flow_counts(json_path, config_path, field_id, debug=False):
             flow_counts[datestr]['IN'] += 1
             flow_counts[datestr]['OUT'] += 1
         if debug:
-            print(f"[{key}][{datestr}] in:{in_ct}, out:{out_ct} => counted IN {1 if in_ct>=out_ct else 0}, OUT {1 if out_ct>=in_ct else 0}")
+            print(f"[{key}][{datestr}] in:{in_ct},out:{out_ct} => IN={1 if in_ct>=out_ct else 0}, OUT={1 if out_ct>=in_ct else 0}")
 
+    # CSV 出力: すべての日付に1行ずつ出力
     out_file = 'in-out_flow.csv'
     with open(out_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['Date', 'IN', 'OUT'])
-        for dt in sorted(flow_counts):
-            writer.writerow([dt, flow_counts[dt]['IN'], flow_counts[dt]['OUT']])
+        days = (end_date - start_date).days + 1
+        for n in range(days):
+            d = start_date + timedelta(days=n)
+            ds = d.isoformat()
+            cnts = flow_counts.get(ds, {'IN': 0, 'OUT': 0})
+            writer.writerow([ds, cnts['IN'], cnts['OUT']])
 
     return out_file
 
