@@ -50,9 +50,12 @@ def check_existing_attachment(file_name, page_id, config):
     results = response.get('results', [])
 
     if results:
-        return results[0]['id']  # 最初に見つかった添付ファイルのIDを返す
+        attachment = results[0]
+        attachment_id = attachment['id']
+        version_number = attachment['version']['number']
+        return attachment_id, version_number
     else:
-        return None
+        return None, None
 
 def upload_attachment(file_path, page_id, config):
     url = config['confluence_url'].rstrip('/')
@@ -60,7 +63,7 @@ def upload_attachment(file_path, page_id, config):
     password = config['password']
 
     file_name = os.path.basename(file_path)
-    existing_attachment_id = check_existing_attachment(file_name, page_id, config)
+    existing_attachment_id, old_version = check_existing_attachment(file_name, page_id, config)
 
     if existing_attachment_id:
         print(f"既存ファイルが見つかりました。ID: {existing_attachment_id} → 更新します。")
@@ -82,11 +85,28 @@ def upload_attachment(file_path, page_id, config):
     print(f"実行コマンド: {' '.join(command)}")
     result = subprocess.run(command, capture_output=True, text=True)
 
-    if result.returncode == 0:
-        print("アップロード成功！")
-    else:
+    if result.returncode != 0:
         print("アップロード失敗...")
         print("stderr:", result.stderr)
+        print("stdout:", result.stdout)
+        sys.exit(1)
+
+    # アップロード後のレスポンス確認
+    try:
+        response_json = json.loads(result.stdout)
+        new_version = None
+        if 'version' in response_json:
+            new_version = response_json['version'].get('number')
+        elif 'results' in response_json and response_json['results']:
+            new_version = response_json['results'][0]['version'].get('number')
+
+        if old_version and new_version and new_version == old_version:
+            print("※ 添付ファイルの中身が同一のため、バージョンは更新されませんでした。")
+        else:
+            print("アップロード成功！")
+    except Exception as e:
+        print("アップロード結果の解析に失敗しました。")
+        print("エラー:", str(e))
         print("stdout:", result.stdout)
         sys.exit(1)
 
