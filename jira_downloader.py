@@ -42,7 +42,7 @@ def create_config_template(path):
         # 出力先ファイル名
         "output_file": "output.json",
         # 並列スレッド数
-        "threads": 6
+        "threads": 6,
         # ConfluenceサーバのベースURL
         "confluence_url": "https://your.confluence.server"
     }
