@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import subprocess
+import time
 
 def load_config(config_path='config.json'):
     if not os.path.exists(config_path):
@@ -70,12 +71,8 @@ def upload_attachment(file_path, page_id, config):
     file_name = os.path.basename(file_path)
     existing_attachment_id, old_version = check_existing_attachment(file_name, page_id, config)
 
-    if existing_attachment_id:
-        print(f"既存ファイルが見つかりました。ID: {existing_attachment_id} → 更新します。")
-        api_url = f"{url}/rest/api/content/{existing_attachment_id}/data"
-    else:
-        print("既存ファイルは見つかりませんでした。新規追加します。")
-        api_url = f"{url}/rest/api/content/{page_id}/child/attachment"
+    print("ファイルをページに添付します（既存ならバージョンアップされます）。")
+    api_url = f"{url}/rest/api/content/{page_id}/child/attachment"
 
     # --proxy-ntlm オプションを使用してcurl実行
     command = [
@@ -96,30 +93,19 @@ def upload_attachment(file_path, page_id, config):
         print("stdout:", result.stdout)
         sys.exit(1)
 
-    # アップロード後のレスポンス確認
-    try:
-        response_json = json.loads(result.stdout)
-        new_version = None
-        if 'version' in response_json:
-            new_version = response_json['version'].get('number')
-        elif 'results' in response_json and response_json['results']:
-            new_version = response_json['results'][0]['version'].get('number')
+    # 少し待ってから再度チェック（反映待ち）
+    time.sleep(2)
 
-        if old_version and new_version:
-            if new_version == old_version:
-                print("※ 添付ファイルの中身が同一のため、バージョンは更新されませんでした。")
-            else:
-                print("アップロード成功！（バージョンが更新されました）")
+    # アップロード後のバージョン確認
+    _, new_version = check_existing_attachment(file_name, page_id, config)
+
+    if old_version and new_version:
+        if new_version == old_version:
+            print("※ 添付ファイルの中身が同一のため、バージョンは更新されませんでした。")
         else:
-            print("アップロード成功！（バージョン情報なし）")
-    except json.JSONDecodeError:
-        print("アップロード成功！（レスポンスがJSON形式ではありません）")
-        print("レスポンス内容:", result.stdout.strip())
-    except Exception as e:
-        print("アップロード結果の解析に失敗しました。")
-        print("エラー:", str(e))
-        print("stdout:", result.stdout)
-        sys.exit(1)
+            print(f"アップロード成功！（バージョンが {old_version} → {new_version} に更新されました）")
+    else:
+        print("アップロード成功！（バージョン情報が取得できませんでした）")
 
 def main():
     if len(sys.argv) != 3:
