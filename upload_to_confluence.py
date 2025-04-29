@@ -23,12 +23,51 @@ def load_config(config_path='config.json'):
     with open(config_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
+def check_existing_attachment(file_name, page_id, config):
+    url = config['confluence_url'].rstrip('/')
+    user = config['username']
+    password = config['password']
+
+    api_url = f"{url}/rest/api/content/{page_id}/child/attachment?filename={file_name}&expand=version"
+
+    command = [
+        "curl",
+        "--proxy-ntlm",
+        "-u", f"{user}:{password}",
+        "-X", "GET",
+        api_url
+    ]
+
+    result = subprocess.run(command, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print("添付ファイル確認失敗...")
+        print("stderr:", result.stderr)
+        print("stdout:", result.stdout)
+        sys.exit(1)
+
+    response = json.loads(result.stdout)
+    results = response.get('results', [])
+
+    if results:
+        return results[0]['id']  # 最初に見つかった添付ファイルのIDを返す
+    else:
+        return None
+
 def upload_attachment(file_path, page_id, config):
     url = config['confluence_url'].rstrip('/')
     user = config['username']
     password = config['password']
 
-    api_url = f"{url}/rest/api/content/{page_id}/child/attachment"
+    file_name = os.path.basename(file_path)
+    existing_attachment_id = check_existing_attachment(file_name, page_id, config)
+
+    if existing_attachment_id:
+        print(f"既存ファイルが見つかりました。ID: {existing_attachment_id} → 更新します。")
+        api_url = f"{url}/rest/api/content/{existing_attachment_id}/data"
+    else:
+        print("既存ファイルは見つかりませんでした。新規追加します。")
+        api_url = f"{url}/rest/api/content/{page_id}/child/attachment"
 
     # --proxy-ntlm オプションを使用してcurl実行
     command = [
