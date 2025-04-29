@@ -46,16 +46,21 @@ def check_existing_attachment(file_name, page_id, config):
         print("stdout:", result.stdout)
         sys.exit(1)
 
-    response = json.loads(result.stdout)
-    results = response.get('results', [])
-
-    if results:
-        attachment = results[0]
-        attachment_id = attachment['id']
-        version_number = attachment['version']['number']
-        return attachment_id, version_number
-    else:
-        return None, None
+    try:
+        response = json.loads(result.stdout)
+        results = response.get('results', [])
+        if results:
+            attachment = results[0]
+            attachment_id = attachment['id']
+            version_number = attachment['version']['number']
+            return attachment_id, version_number
+        else:
+            return None, None
+    except Exception as e:
+        print("添付ファイルの取得結果の解析に失敗しました。")
+        print("エラー:", str(e))
+        print("レスポンス:", result.stdout.strip())
+        sys.exit(1)
 
 def upload_attachment(file_path, page_id, config):
     url = config['confluence_url'].rstrip('/')
@@ -100,10 +105,16 @@ def upload_attachment(file_path, page_id, config):
         elif 'results' in response_json and response_json['results']:
             new_version = response_json['results'][0]['version'].get('number')
 
-        if old_version and new_version and new_version == old_version:
-            print("※ 添付ファイルの中身が同一のため、バージョンは更新されませんでした。")
+        if old_version and new_version:
+            if new_version == old_version:
+                print("※ 添付ファイルの中身が同一のため、バージョンは更新されませんでした。")
+            else:
+                print("アップロード成功！（バージョンが更新されました）")
         else:
-            print("アップロード成功！")
+            print("アップロード成功！（バージョン情報なし）")
+    except json.JSONDecodeError:
+        print("アップロード成功！（レスポンスがJSON形式ではありません）")
+        print("レスポンス内容:", result.stdout.strip())
     except Exception as e:
         print("アップロード結果の解析に失敗しました。")
         print("エラー:", str(e))
