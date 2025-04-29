@@ -15,12 +15,12 @@ def load_config(config_path='config.json'):
             "threads": 4,
             "confluence_url": "https://your.confluence.server"
         }
-        with open(config_path, 'w') as f:
+        with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(template, f, indent=4)
         print(f"設定ファイル '{config_path}' を作成しました。内容を編集してください。")
         sys.exit(1)
 
-    with open(config_path, 'r') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def upload_attachment(file_path, page_id, config):
