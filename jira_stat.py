@@ -7,11 +7,10 @@ import os
 
 
 def parse_iso(dt_str):
-    # ISO 8601 string to timezone-aware datetime
+    # ISO 8601 文字列をタイムゾーン対応 datetime に変換
     try:
         dt = datetime.fromisoformat(dt_str)
     except ValueError:
-        # Fallback for strings without offset
         dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S.%f%z")
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -30,7 +29,6 @@ def extract_field_counts(json_path, field_id, debug=False):
         key = issue.get('key')
         created_dt = parse_iso(issue['fields']['created'])
         events = []
-        # initial status determination
         histories = issue.get('changelog', {}).get('histories', [])
         history_events = []
         for hist in histories:
@@ -41,20 +39,15 @@ def extract_field_counts(json_path, field_id, debug=False):
                     to_s = item.get('toString') or None
                     history_events.append((ts, from_s, to_s))
         history_events.sort(key=lambda x: x[0])
-        # determine initial status
+
         if history_events and history_events[0][1]:
             init_status = history_events[0][1]
         else:
-            # fallback to current field value
             val = issue['fields'].get(field_id)
-            if isinstance(val, dict):
-                init_status = val.get('name')
-            else:
-                init_status = val
-        # record creation as midnight UTC event
+            init_status = val.get('name') if isinstance(val, dict) else val
+
         events.append((datetime.combine(created_dt.date(), time(0), tzinfo=timezone.utc), init_status))
         all_statuses.add(init_status)
-        # record transitions
         for ts, _from, to in history_events:
             events.append((ts, to))
             all_statuses.add(to)
@@ -63,17 +56,12 @@ def extract_field_counts(json_path, field_id, debug=False):
         events.sort(key=lambda x: x[0])
         ticket_events[key] = events
 
-    # determine date range
-    dates = []
-    for events in ticket_events.values():
-        for ts, _ in events:
-            dates.append(ts.date())
+    dates = [ts.date() for evs in ticket_events.values() for ts, _ in evs]
     if not dates:
         return [], []
     start_date = min(dates)
     end_date = datetime.now(timezone.utc).date()
 
-    # prepare daily counts
     status_list = sorted(all_statuses)
     daily_counts = []
     for single_date in (start_date + timedelta(n) for n in range((end_date - start_date).days + 1)):
@@ -93,64 +81,86 @@ def extract_field_counts(json_path, field_id, debug=False):
         row = [single_date.isoformat()] + [count[s] for s in status_list]
         daily_counts.append(row)
 
-    # write CSV(s)
-    stat_default = 'stat_status.csv'
-    with open(stat_default, 'w', newline='', encoding='utf-8') as f:
+    default_csv = 'stat_status.csv'
+    with open(default_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['Date'] + status_list)
         writer.writerows(daily_counts)
-    extra_file = None
+
+    files = [default_csv]
     if field_id != 'status':
-        extra_file = f'stat_{field_id}.csv'
-        with open(extra_file, 'w', newline='', encoding='utf-8') as f:
+        extra = f'stat_{field_id}.csv'
+        with open(extra, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['Date'] + status_list)
             writer.writerows(daily_counts)
+        files.append(extra)
 
-    return [stat_default] + ([extra_file] if extra_file else []), status_list
+    return files, status_list
 
 
 def extract_flow_counts(json_path, config_path, field_id, debug=False):
-    # load issues and history
+    # JSON からチケットごとの遷移履歴を抽出
     with open(json_path, encoding='utf-8') as f:
         data = json.load(f)
     issues = data.get('issues', [])
 
-    # gather all history transitions
-    transitions = []  # list of (date, from, to)
+    transitions = []  # 各チケット・日付ごとの (ticket_key, datestr, from, to)
     statuses = set()
     for issue in issues:
+        key = issue.get('key')
         histories = issue.get('changelog', {}).get('histories', [])
         for hist in histories:
             ts = parse_iso(hist.get('created'))
+            datestr = ts.date().isoformat()
             for item in hist.get('items', []):
                 if item.get('field') == field_id:
                     _from = item.get('fromString') or ''
                     _to = item.get('toString') or ''
-                    datestr = ts.date().isoformat()
-                    transitions.append((datestr, _from, _to))
+                    transitions.append((key, datestr, _from, _to))
                     statuses.update([_from, _to])
-    # config generation
+
+    # 初回実行時は設定ファイルを自動生成（デフォルト: IGNORE）
     if not os.path.exists(config_path):
         matrix = {s: {t: 'IGNORE' for t in statuses} for s in statuses}
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(matrix, f, ensure_ascii=False, indent=2)
-        print(f"{config_path} が生成されました。編集後、再度実行してください。")
+        print(f"{config_path} を生成しました。編集後に再実行してください。")
         return None
 
-    # load config
     with open(config_path, encoding='utf-8') as f:
         config = json.load(f)
 
-    flow_counts = defaultdict(lambda: {'IN': 0, 'OUT': 0})
-    for datestr, _from, _to in transitions:
+    # 件数集計: チケット・日付ごとに IN/OUT カウント
+    ticket_date_counts = defaultdict(lambda: {'IN': 0, 'OUT': 0})
+    for key, datestr, _from, _to in transitions:
         action = config.get(_from, {}).get(_to, 'IGNORE')
-        if action in ('IN', 'OUT'):
-            flow_counts[datestr][action] += 1
-            if debug:
-                print(f"Transition on {datestr}: {_from} -> {_to} as {action}")
+        if action == 'IN':
+            ticket_date_counts[(key, datestr)]['IN'] += 1
+        elif action == 'OUT':
+            ticket_date_counts[(key, datestr)]['OUT'] += 1
+        elif action == 'INOUT':
+            ticket_date_counts[(key, datestr)]['IN'] += 1
+            ticket_date_counts[(key, datestr)]['OUT'] += 1
+        # IGNORE は無視
+        if debug:
+            print(f"[{key}][{datestr}] Transition {_from}->{_to} as {action}")
 
-    # write in-out_flow.csv
+    # 日付ごとにルール適用: IN>OUT => IN=1,OUT=0; IN<OUT => IN=0,OUT=1; IN=OUT => IN=1,OUT=1
+    flow_counts = defaultdict(lambda: {'IN': 0, 'OUT': 0})
+    for (key, datestr), cnts in ticket_date_counts.items():
+        in_ct = cnts['IN']
+        out_ct = cnts['OUT']
+        if in_ct > out_ct:
+            flow_counts[datestr]['IN'] += 1
+        elif in_ct < out_ct:
+            flow_counts[datestr]['OUT'] += 1
+        else:
+            flow_counts[datestr]['IN'] += 1
+            flow_counts[datestr]['OUT'] += 1
+        if debug:
+            print(f"[{key}][{datestr}] in:{in_ct}, out:{out_ct} => counted IN {1 if in_ct>=out_ct else 0}, OUT {1 if out_ct>=in_ct else 0}")
+
     out_file = 'in-out_flow.csv'
     with open(out_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -175,10 +185,8 @@ def main():
         return
 
     flow = extract_flow_counts(args.input_json, 'in-out_config.json', args.field_id, args.debug)
-
     outputs = csv_files + ([flow] if flow else [])
     print(f"統計結果を {', '.join(outputs)} に出力しました。")
-
 
 if __name__ == '__main__':
     main()
