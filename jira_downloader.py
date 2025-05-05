@@ -15,7 +15,7 @@ JIRAサーバーからチケット情報をJSON形式でダウンロードする
    - .jira_cache にキャッシュし、キャッシュ内の lastUpdated と比較して有効性判定
    - 必要に応じて再取得し、キャッシュ更新
 6. 履歴フィルタリング & field 名→ID 書き換え
-7. 出力ファイルに最終JSONを書き込み
+7. 出力ファイルに最終JSONを書き込み（トップレベルに "issues" キー）
 
 注意点:
 - curl の出力は必ず utf-8 でデコードし、errors='replace' を指定
@@ -39,9 +39,6 @@ DEFAULT_THREADS    = 4
 
 # --- テンプレート生成 ---
 def create_config_template(path):
-    """
-    config.json の雛形を作成して終了
-    """
     template = {
         "jira_url":    "https://your.jira.server",
         "username":    "your_username",
@@ -56,10 +53,6 @@ def create_config_template(path):
 
 
 def create_fields_template(path, jira_url, auth):
-    """
-    fields_config.json の雛形を作成して終了
-    JIRA REST API からフィールド一覧を取得して default template を生成
-    """
     print(f"[INFO] フィールド一覧取得: {jira_url}/rest/api/2/field")
     try:
         cmd = ['curl', '-s', '--proxy-ntlm',
@@ -91,7 +84,6 @@ def load_json(path):
 
 # --- URL組み立て ---
 def build_search_url(base, jql, fields, start_at, max_results):
-    """JQL, fields, startAt, maxResults を組み込んだ検索URLを返す"""
     q_jql = quote(jql, safe='')
     q_fields = quote(fields, safe='')
     return (f"{base.rstrip('/')}/rest/api/2/search?"
@@ -100,7 +92,6 @@ def build_search_url(base, jql, fields, start_at, max_results):
 
 # --- チケット一覧取得 ---
 def fetch_issues(cfg, fields_param):
-    """総件数を取得後、指定バッチごとにチケット一覧を取得して結合"""
     print("[STEP] チケット総数取得とバッチ取得を開始")
     url0 = build_search_url(cfg['jira_url'], cfg['jql'], fields_param, 0, 1)
     r0 = subprocess.run(
@@ -115,9 +106,7 @@ def fetch_issues(cfg, fields_param):
     issues = []
     for start in range(0, total, CHUNK_SIZE):
         print(f" 取得 {start+1}～{min(start+CHUNK_SIZE, total)} 件目")
-        urlN = build_search_url(
-            cfg['jira_url'], cfg['jql'], fields_param, start, CHUNK_SIZE
-        )
+        urlN = build_search_url(cfg['jira_url'], cfg['jql'], fields_param, start, CHUNK_SIZE)
         rN = subprocess.run(
             ['curl', '-s', '--proxy-ntlm',
              '-u', f"{cfg['username']}:{cfg['password']}", urlN],
@@ -131,9 +120,7 @@ def fetch_issues(cfg, fields_param):
 def fetch_full_changelog(
     jira_url, auth, issue_key, updated, h_ids, h_names, name_to_id
 ):
-    """個別 issue のチェンジログをページング取得しキャッシュと比較"""
     cache_path = os.path.join(CACHE_DIR, f"{issue_key}_changelog.json")
-    # キャッシュ確認
     if os.path.exists(cache_path):
         try:
             cache = load_json(cache_path)
@@ -185,7 +172,6 @@ def fetch_full_changelog(
 
 # --- メイン ---
 def main():
-    # テンプレート存在確認
     if not os.path.isfile(CONFIG_FILE):
         create_config_template(CONFIG_FILE)
         return
@@ -198,26 +184,24 @@ def main():
         )
         return
 
-    # 設定ファイル読み込み
     cfg  = load_json(CONFIG_FILE)
     fcfg = load_json(FIELDS_FILE)
-    # テンプレート形式対応: dict形式なら配列を取り出す
     if isinstance(fcfg, dict) and 'fields' in fcfg:
         fcfg = fcfg['fields']
 
     # ダウンロード対象フィールド抽出
     download = [f['id'] for f in fcfg if f.get('download')]
-    # キャッシュ用に必ず updated を先頭に追加
+    # キャッシュ用：必ず updated を追加
     if 'updated' not in download:
         download.insert(0, 'updated')
     fields_param = ','.join(download)
 
     # 履歴取得対象
-    h_ids   = {f['id']   for f in fcfg if f.get('downloadHistory')}
+    h_ids   = {f['id'] for f in fcfg if f.get('downloadHistory')}
     h_names = {f['name'] for f in fcfg if f.get('downloadHistory')}
-    name2id = {f['name']:f['id'] for f in fcfg}
+    name2id = {f['name']: f['id'] for f in fcfg}
 
-    # キャッシュディレクトリ初期化（一度だけ）
+    # キャッシュディレクトリ初期化
     os.makedirs(CACHE_DIR, exist_ok=True)
 
     # チケット一覧取得
@@ -230,29 +214,29 @@ def main():
             exe.submit(
                 fetch_full_changelog,
                 cfg['jira_url'],
-                {'username':cfg['username'], 'password':cfg['password']},
+                {'username': cfg['username'], 'password': cfg['password']},
                 issue.get('key'),
-                issue.get('fields',{}).get('updated'),
+                issue.get('fields', {}).get('updated'),
                 h_ids,
                 h_names,
                 name2id
-            ): issue.get('key')
-            for issue in issues
+            ): issue.get('key') for issue in issues
         }
         for fut, key in futures.items():
             results[key] = fut.result()
 
-    # 最終出力
-    out = []
+    # 最終出力: トップレベルに "issues" キー
+    output_data = {'issues': []}
     for issue in issues:
         key = issue.get('key')
-        out.append({
-            'key': key,
-            'fields': issue.get('fields', {}),
+        output_data['issues'].append({
+            'key':      key,
+            'fields':   issue.get('fields', {}),
             'changelog': results.get(key, [])
         })
+
     with open(cfg.get('output_file', 'output.json'), 'w', encoding='utf-8') as f:
-        json.dump(out, f, indent=4, ensure_ascii=False)
+        json.dump(output_data, f, indent=4, ensure_ascii=False)
     print("完了: 出力 ->", cfg.get('output_file', 'output.json'))
 
 if __name__ == '__main__':
