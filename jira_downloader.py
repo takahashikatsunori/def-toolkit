@@ -12,7 +12,7 @@ JIRAサーバーからチケット情報をJSON形式でダウンロードする
 4. 初回リクエストで対象チケット総数を取得し、必要な分割オフセットを計算
 5. ThreadPoolExecutorにより並列でcurlを実行し、各ページを取得
 6. 取得結果(JSON)をパースし、ダウンロード対象フィールドと履歴をフィルタリング
-   - フル履歴取得を行い、100件制限を回避
+   - フル履歴取得を行い、100件制限を回避（無限ループ防止）
 7. 全件を統合し、最終的な1つのJSONファイル(output.json)として保存
 8. 各ステップで詳細なログを標準出力に出力し、エラー発生時は可能な限り情報を表示
 """
@@ -38,8 +38,7 @@ def create_config_template(path):
         "password": "your_password",
         "jql": "project = ABC",
         "output_file": "output.json",
-        "threads": 6,
-        "confluence_url": "https://your.confluence.server"
+        "threads": 4
     }
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(template, f, indent=4, ensure_ascii=False)
@@ -86,11 +85,12 @@ def fetch_issues_slice(jira_url, auth, jql, fields_param, start_at, max_results)
         print(f"[ERROR] fetch_issues_slice failed: {e}")
         return None
 
-# 個別課題のフルチェンジログ取得 (100件超も取得)
+# 個別課題のフルチェンジログ取得 (100件超も取得、無限ループ防止)
 def fetch_full_changelog(jira_url, auth, issue_key):
     all_histories = []
     start_at = 0
     max_chg = 100
+    total = None
     while True:
         url = (f"{jira_url}/rest/api/2/issue/{quote(issue_key, safe='')}"
                f"?expand=changelog&startAt={start_at}&maxResults={max_chg}")
@@ -99,16 +99,22 @@ def fetch_full_changelog(jira_url, auth, issue_key):
             cmd = ['curl', '-s', '--proxy-ntlm', '-u', f"{auth['username']}:{auth['password']}", url]
             res = subprocess.run(cmd, capture_output=True, check=True)
             data = json.loads(res.stdout.decode('utf-8', errors='replace'))
-            histories = data.get('changelog', {}).get('histories', [])
+            changelog = data.get('changelog', {})
+            histories = changelog.get('histories', [])
+            if total is None:
+                total = changelog.get('total', 0)
         except Exception as e:
             print(f"[ERROR] fetch_full_changelog failed for {issue_key}: {e}")
             break
         if not histories:
+            print(f"[INFO] {issue_key} のチェンジログ取得終了 (empty)")
             break
         all_histories.extend(histories)
-        if len(histories) < max_chg:
+        start_at += len(histories)
+        # 総件数が取得済みなら、取得済み開始位置が総数以上で終了
+        if total is not None and start_at >= total:
+            print(f"[INFO] {issue_key} のチェンジログ取得終了 (reached total={total})")
             break
-        start_at += max_chg
     return all_histories
 
 # メイン処理
@@ -123,8 +129,11 @@ def main():
 
     cfg = json.load(open(paths['config'], encoding='utf-8'))
     fcfg = json.load(open(paths['fields'], encoding='utf-8'))
-    jira_url, auth, jql = cfg['jira_url'], {'username':cfg['username'],'password':cfg['password']}, cfg['jql']
-    output_file, threads = cfg.get('output_file','output.json'), cfg.get('threads',4)
+    jira_url = cfg['jira_url']
+    auth = {'username':cfg['username'], 'password':cfg['password']}
+    jql = cfg['jql']
+    output_file = cfg.get('output_file','output.json')
+    threads = cfg.get('threads',4)
     download_fields = [f['id'] for f in fcfg['fields'] if f.get('download')]
     fields_param = ','.join(download_fields)
 
@@ -135,8 +144,8 @@ def main():
 
     offsets = list(range(0, total, 1000))
     all_issues = []
-    with ThreadPoolExecutor(max_workers=threads) as exec:
-        futures = {exec.submit(fetch_issues_slice, jira_url, auth, jql, fields_param, off, 1000):off for off in offsets}
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = {executor.submit(fetch_issues_slice, jira_url, auth, jql, fields_param, off, 1000):off for off in offsets}
         for fut in as_completed(futures):
             data = fut.result()
             if data and 'issues' in data:
