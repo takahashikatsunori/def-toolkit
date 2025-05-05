@@ -229,12 +229,14 @@ def main():
     output_data = {'issues': []}
     for issue in issues:
         key = issue.get('key')
+        # 元の形式: changelog はオブジェクトとして histories 配列を持つ
         output_data['issues'].append({
             'key':      key,
             'fields':   issue.get('fields', {}),
-            'changelog': results.get(key, [])
+            'changelog': {'histories': results.get(key, [])}
         })
 
+    # ファイルへ書き込み
     with open(cfg.get('output_file', 'output.json'), 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=4, ensure_ascii=False)
     print("完了: 出力 ->", cfg.get('output_file', 'output.json'))
