@@ -7,14 +7,15 @@ JIRAサーバーからチケット情報をJSON形式でダウンロードする
 1. 基本設定ファイル(config.json)の存在チェック
    - 存在しない場合、テンプレートを作成して終了
 2. フィールド設定ファイル(fields_config.json)の存在チェック
-   - 存在しない場合、JIRAサーバーからフィールド一覧を取得し、テンプレートを作成して終了
-3. 設定ファイルを読み込み、JQL・取得フィールド・履歴取得設定を取得
-4. 初回リクエストで対象チケット総数を取得し、必要な分割オフセットを計算
-5. ThreadPoolExecutorにより並列でcurlを実行し、各ページを取得
-6. 取得結果(JSON)をパースし、ダウンロード対象フィールドと履歴をフィルタリング
-   - フル履歴取得を行い、100件制限を回避（無限ループ防止）
-7. 全件を統合し、最終的な1つのJSONファイル(output.json)として保存
-8. 各ステップで詳細なログを標準出力に出力し、エラー発生時は可能な限り情報を表示
+   - 存在しない場合、JIRAサーバーからフィールド一覧を取得してテンプレートを作成し終了
+3. 設定ファイル読み込み
+4. チケット総数取得
+5. 並列でチケット一覧取得
+6. 各チケットのフルチェンジログを並列取得（100件制限を回避）
+7. 履歴フィルタリング
+8. 最終JSONファイルとして保存
+
+※基本設定ファイルとフィールド設定ファイルはローカルに保存し、Git管理から除外してください。
 """
 import os
 import sys
@@ -23,30 +24,43 @@ import subprocess
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 設定ファイル名定義
-def get_default_paths():
-    return {
-        'config': 'config.json',
-        'fields': 'fields_config.json'
-    }
+# --- 定数定義 ---
+CONFIG_FILE = 'config.json'
+FIELDS_FILE = 'fields_config.json'
+CHUNK_SIZE = 1000    # チケット一覧取得時の最大件数
+CHANGELOG_PAGE = 100  # 個別チェンジログ取得時の1リクエストあたり件数
 
-# 基本設定ファイルのテンプレート作成
+# --- テンプレート生成関数 ---
+
 def create_config_template(path):
+    """
+    基本設定ファイル(config.json)のテンプレートを生成する
+    - jira_url: JIRAのベースURL
+    - username/password: 認証情報
+    - jql: ダウンロード対象チケットを指定するJQL
+    - output_file: 出力ファイル名
+    - threads: 並列スレッド数
+    """
     template = {
-        "jira_url": "https://your.jira.server",
-        "username": "your_username",
-        "password": "your_password",
-        "jql": "project = ABC",
-        "output_file": "output.json",
-        "threads": 4
+        "jira_url": "https://your.jira.server",  # JIRAサーバーのURL
+        "username": "your_username",             # アクセス用ユーザー名
+        "password": "your_password",             # アクセス用パスワード
+        "jql": "project = ABC",                 # ダウンロード対象JQL
+        "output_file": "output.json",            # 出力ファイル名
+        "threads": 4                               # 並列スレッド数
     }
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(template, f, indent=4, ensure_ascii=False)
-    print(f"[INFO] 基本設定ファイルのテンプレートを '{path}' に作成しました。編集後、再実行してください。")
+    print(f"[INFO] 基本設定ファイルテンプレートを '{path}' に作成しました。内容を編集後、再実行してください。")
 
-# フィールド設定ファイルのテンプレート作成
+
 def create_fields_template(path, jira_url, auth):
-    print(f"[INFO] フィールド一覧を取得中: {jira_url}/rest/api/2/field")
+    """
+    フィールド設定ファイル(fields_config.json)のテンプレートを生成する
+    - JIRAサーバーからフィールド一覧を取得
+    - デフォルトで summary と status をダウンロード対象＆履歴取得対象に設定
+    """
+    print(f"[INFO] フィールド一覧を取得しています: {jira_url}/rest/api/2/field")
     try:
         cmd = [
             'curl', '-s', '--proxy-ntlm',
@@ -56,9 +70,10 @@ def create_fields_template(path, jira_url, auth):
         result = subprocess.run(cmd, capture_output=True, check=True)
         fields = json.loads(result.stdout.decode('utf-8', errors='replace'))
     except Exception as e:
-        print(f"[ERROR] フィールド取得に失敗: {e}")
+        print(f"[ERROR] フィールド取得失敗: {e}")
         sys.exit(1)
 
+    # テンプレート作成
     template = {"fields": []}
     for f in fields:
         template['fields'].append({
@@ -69,34 +84,41 @@ def create_fields_template(path, jira_url, auth):
         })
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(template, f, indent=4, ensure_ascii=False)
-    print(f"[INFO] フィールド設定ファイルのテンプレートを '{path}' に作成しました。編集後、再実行してください。")
+    print(f"[INFO] フィールド設定ファイルテンプレートを '{path}' に作成しました。内容を編集後、再実行してください。")
 
-# チケット検索API呼び出し
+# --- JIRA API 呼び出し ---
+
 def fetch_issues_slice(jira_url, auth, jql, fields_param, start_at, max_results):
-    encoded_jql = quote(jql, safe='')
-    encoded_fields = quote(fields_param, safe='')
-    url = f"{jira_url}/rest/api/2/search?jql={encoded_jql}&startAt={start_at}&maxResults={max_results}&fields={encoded_fields}"
-    print(f"[INFO] チケット取得: startAt={start_at}, maxResults={max_results}")
+    """
+    チケット一覧(部分)を取得する
+    start_at: 取得開始オフセット
+    max_results: 取得件数
+    """
+    # パラメータURLエンコード
+    e_jql = quote(jql, safe='')
+    e_fields = quote(fields_param, safe='')
+    url = f"{jira_url}/rest/api/2/search?jql={e_jql}&startAt={start_at}&maxResults={max_results}&fields={e_fields}"
+    cmd = ['curl', '-s', '--proxy-ntlm', '-u', f"{auth['username']}:{auth['password']}", url]
     try:
-        cmd = ['curl', '-s', '--proxy-ntlm', '-u', f"{auth['username']}:{auth['password']}", url]
         res = subprocess.run(cmd, capture_output=True, check=True)
         return json.loads(res.stdout.decode('utf-8', errors='replace'))
     except Exception as e:
-        print(f"[ERROR] fetch_issues_slice failed: {e}")
+        print(f"[ERROR] fetch_issues_slice エラー: {e}")
         return None
 
-# 個別課題のフルチェンジログ取得 (100件超も取得、無限ループ防止)
+
 def fetch_full_changelog(jira_url, auth, issue_key):
+    """
+    単一課題のフルチェンジログを取得 (100件制限をページングで回避)
+    """
     all_histories = []
     start_at = 0
-    max_chg = 100
     total = None
     while True:
-        url = (f"{jira_url}/rest/api/2/issue/{quote(issue_key, safe='')}"
-               f"?expand=changelog&startAt={start_at}&maxResults={max_chg}")
-        print(f"[INFO] フルチェンジログ取得: {issue_key} startAt={start_at}")
+        e_key = quote(issue_key, safe='')
+        url = f"{jira_url}/rest/api/2/issue/{e_key}?expand=changelog&startAt={start_at}&maxResults={CHANGELOG_PAGE}"
+        cmd = ['curl', '-s', '--proxy-ntlm', '-u', f"{auth['username']}:{auth['password']}", url]
         try:
-            cmd = ['curl', '-s', '--proxy-ntlm', '-u', f"{auth['username']}:{auth['password']}", url]
             res = subprocess.run(cmd, capture_output=True, check=True)
             data = json.loads(res.stdout.decode('utf-8', errors='replace'))
             changelog = data.get('changelog', {})
@@ -104,80 +126,94 @@ def fetch_full_changelog(jira_url, auth, issue_key):
             if total is None:
                 total = changelog.get('total', 0)
         except Exception as e:
-            print(f"[ERROR] fetch_full_changelog failed for {issue_key}: {e}")
+            print(f"[ERROR] fetch_full_changelog ({issue_key}) エラー: {e}")
             break
+        # 履歴が空なら終了
         if not histories:
-            print(f"[INFO] {issue_key} のチェンジログ取得終了 (empty)")
             break
         all_histories.extend(histories)
         start_at += len(histories)
-        # 総件数が取得済みなら、取得済み開始位置が総数以上で終了
+        # 取得済みが総数以上なら終了
         if total is not None and start_at >= total:
-            print(f"[INFO] {issue_key} のチェンジログ取得終了 (reached total={total})")
             break
     return all_histories
 
-# メイン処理
+# --- メイン処理 ---
+
 def main():
-    paths = get_default_paths()
-    # 1,2. 設定ファイルチェック
-    if not os.path.isfile(paths['config']): create_config_template(paths['config']); sys.exit(0)
-    if not os.path.isfile(paths['fields']):
-        cfg = json.load(open(paths['config'], encoding='utf-8'))
-        create_fields_template(paths['fields'], cfg['jira_url'], {'username':cfg['username'],'password':cfg['password']})
+    # 1. 設定ファイルチェック
+    if not os.path.isfile(CONFIG_FILE):
+        create_config_template(CONFIG_FILE)
+        sys.exit(0)
+    if not os.path.isfile(FIELDS_FILE):
+        cfg = json.load(open(CONFIG_FILE, encoding='utf-8'))
+        create_fields_template(FIELDS_FILE, cfg['jira_url'], {'username': cfg['username'], 'password': cfg['password']})
         sys.exit(0)
 
-    cfg = json.load(open(paths['config'], encoding='utf-8'))
-    fcfg = json.load(open(paths['fields'], encoding='utf-8'))
+    # 2. 設定読み込み
+    cfg = json.load(open(CONFIG_FILE, encoding='utf-8'))
+    fcfg = json.load(open(FIELDS_FILE, encoding='utf-8'))
     jira_url = cfg['jira_url']
-    auth = {'username':cfg['username'], 'password':cfg['password']}
+    auth = {'username': cfg['username'], 'password': cfg['password']}
     jql = cfg['jql']
-    output_file = cfg.get('output_file','output.json')
-    threads = cfg.get('threads',4)
+    output_file = cfg.get('output_file', 'output.json')
+    threads = cfg.get('threads', 4)
+
+    # 3. ダウンロード対象フィールド準備
     download_fields = [f['id'] for f in fcfg['fields'] if f.get('download')]
     fields_param = ','.join(download_fields)
 
-    print("[INFO] 対象チケット総数を取得中...")
+    # 4. チケット総数取得
+    print("[INFO] チケット総数を取得中...")
     initial = fetch_issues_slice(jira_url, auth, jql, fields_param, 0, 1)
-    total = initial.get('total',0) if initial else 0
+    total = initial.get('total', 0) if initial else 0
     print(f"[INFO] 対象チケット総数: {total}")
 
-    offsets = list(range(0, total, 1000))
+    # 5. チケット一覧並列取得
+    offsets = list(range(0, total, CHUNK_SIZE))
     all_issues = []
+    print("[INFO] チケット一覧の並列取得を開始... ")
     with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = {executor.submit(fetch_issues_slice, jira_url, auth, jql, fields_param, off, 1000):off for off in offsets}
+        futures = {executor.submit(fetch_issues_slice, jira_url, auth, jql, fields_param, off, CHUNK_SIZE): off for off in offsets}
         for fut in as_completed(futures):
             data = fut.result()
             if data and 'issues' in data:
-                all_issues.extend(data['issues'])
-                print(f"[INFO] startAt={futures[fut]} 取得 {len(data['issues'])} 件")
+                issues = data['issues']
+                all_issues.extend(issues)
+                print(f"[INFO] startAt={futures[fut]} 取得 {len(issues)} 件")
 
-    # フルチェンジログ取得
-    print("[INFO] 全課題のフルチェンジログ取得を開始します...")
-    for idx, issue in enumerate(all_issues,1):
-        key = issue.get('key') or issue.get('id')
-        histories = fetch_full_changelog(jira_url, auth, key)
-        issue['changelog'] = {'histories': histories}
-        print(f"[INFO] {idx}/{len(all_issues)} {key} のチェンジログ {len(histories)} 件取得完了")
+    # 6. フルチェンジログ並列取得
+    print("[INFO] フルチェンジログの並列取得を開始... ")
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        future_map = {executor.submit(fetch_full_changelog, jira_url, auth, issue.get('key') or issue.get('id')): issue for issue in all_issues}
+        for fut in as_completed(future_map):
+            issue = future_map[fut]
+            histories = fut.result() or []
+            issue['changelog'] = {'histories': histories}
+            print(f"[INFO] {issue.get('key')} のチェンジログ {len(histories)} 件取得完了")
 
-    # 履歴フィルタリング
-    print("[INFO] 履歴フィルタリング実行...")
+    # 7. 履歴フィルタリング
     history_ids = {f['id'] for f in fcfg['fields'] if f.get('downloadHistory')}
     history_names = {f['name'] for f in fcfg['fields'] if f.get('downloadHistory')}
+    print("[INFO] 履歴フィルタリングを実行... ")
     for issue in all_issues:
         filtered = []
-        for hist in issue['changelog']['histories']:
-            items = [it for it in hist.get('items',[])
-                     if it.get('fieldId') in history_ids or it.get('field') in history_names]
+        for hist in issue.get('changelog', {}).get('histories', []):
+            items = [it for it in hist.get('items', []) if it.get('fieldId') in history_ids or it.get('field') in history_names]
             if items:
                 hist['items'] = items
                 filtered.append(hist)
         issue['changelog']['histories'] = filtered
 
-    # 出力
-    with open(output_file,'w',encoding='utf-8') as f:
-        json.dump({'issues':all_issues}, f, indent=4, ensure_ascii=False)
-    print(f"[INFO] 保存完了: {output_file} (全{len(all_issues)}件)")
+    # 8. 出力
+    print(f"[INFO] 全件取得完了: {len(all_issues)} 件。ファイル '{output_file}' に保存します。")
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump({'issues': all_issues}, f, indent=4, ensure_ascii=False)
+        print("[INFO] 正常に保存しました。終了します。")
+    except Exception as e:
+        print(f"[ERROR] ファイル保存中にエラー発生: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
